@@ -6,13 +6,15 @@
 // quotes inside unquoted fields literal, fields stay strings, header/rows
 // padded or cut with short_row/long_row, errors {code, line, row} in order).
 //
-// Speed comes from letting the engine do the scanning: each unquoted field is
-// found with two native indexOf calls (',' and '\n') plus one slice, instead
-// of a per-character JavaScript loop with per-character string appends. The
-// slow character paths only run where the input actually needs them: a field
-// holding a CR, or a quoted field holding a doubled quote. Quoted fields
-// likewise jump straight to the next '"' with indexOf and slice the content
-// in one go when it holds no CR and no doubled quote (the common case).
+// Speed comes from letting the engine do the scanning: each unquoted field
+// is found with two native indexOf calls (',' and '\n') plus one slice,
+// instead of a per-character JavaScript loop with per-character string
+// appends. The slow character paths only run where the input actually needs
+// them: a field holding a stray CR, or a quoted field holding a doubled
+// quote. Quoted fields likewise jump straight to the next '"' with indexOf
+// and slice the content in one go when it holds no CR and no doubled quote
+// (the common case). Field results travel in module-level slots instead of
+// a fresh array per field.
 //
 // Pure: no clock, no randomness, no locale, nothing kept between calls.
 
@@ -37,6 +39,11 @@ export function run(input) {
   // The record being read: the line it starts on and the index in rows it takes (null: the header).
   let recLine = 1;
   let recRow = null;
+
+  // How the last field read ended, and how many characters readUnquoted kept
+  // (the quote_junk test reads it right after its own readUnquoted call).
+  let lastEnded = END;
+  let lastAdded = 0;
 
   function err(code) {
     errors.push({ code, line: recLine, row: recRow });
@@ -74,30 +81,46 @@ export function run(input) {
   }
 
   // Reads unquoted characters onto `value` up to the next comma or line
-  // break: a CR not followed by LF is dropped (stray_cr). Returns
-  // [value, ended, added]; `added` counts the characters kept here.
+  // break: a CR not followed by LF is dropped (stray_cr). Returns the field
+  // and sets lastEnded / lastAdded; `added` counts the characters kept here.
   function readUnquoted(value, added) {
     let ci = text.indexOf(',', pos);
     if (ci === -1) ci = n;
     let li = text.indexOf('\n', pos);
     if (li === -1) li = n;
     const end = ci < li ? ci : li;
-    let v = end > pos ? text.slice(pos, end) : '';
-    if (v.indexOf('\r') === -1) {
+    const v = end > pos ? text.slice(pos, end) : '';
+    const ri = v.indexOf('\r');
+    if (ri === -1) {
       if (end >= n) {
         pos = n;
-        return [value + v, END, added + v.length];
+        lastEnded = END;
+        lastAdded = added + v.length;
+        return value + v;
       }
       if (end === ci) {
         pos = end + 1;
-        return [value + v, COMMA, added + v.length];
+        lastEnded = COMMA;
+        lastAdded = added + v.length;
+        return value + v;
       }
       pos = end + 1;
       line += 1;
-      return [value + v, LINE_BREAK, added + v.length];
+      lastEnded = LINE_BREAK;
+      lastAdded = added + v.length;
+      return value + v;
     }
-    // Slow path: v holds one or more CRs.
+    if (end < n && end === li && ri === v.length - 1) {
+      // The only CR is the trailing one of a CRLF line break.
+      pos = end + 1;
+      line += 1;
+      lastEnded = LINE_BREAK;
+      lastAdded = added + v.length - 1;
+      return value + v.slice(0, -1);
+    }
+    // Slow path: v holds one or more stray CRs.
     let ending;
+    let w = v;
     if (end >= n) {
       ending = END;
       pos = n;
@@ -106,25 +129,27 @@ export function run(input) {
       pos = end + 1;
     } else {
       // end === li: a CR at the very end of v is the CRLF line break itself.
-      if (v.charCodeAt(v.length - 1) === 13) v = v.slice(0, -1);
+      if (w.charCodeAt(w.length - 1) === 13) w = w.slice(0, -1);
       ending = LINE_BREAK;
       pos = end + 1;
       line += 1;
     }
-    // Drop the lone CRs left in v, one stray_cr error each.
+    // Drop the lone CRs left in w, one stray_cr error each.
     let out = value;
     let s = 0;
-    let r = v.indexOf('\r', s);
+    let r = w.indexOf('\r', s);
     while (r !== -1) {
       err('stray_cr');
-      out += v.slice(s, r);
+      out += w.slice(s, r);
       added += r - s;
       s = r + 1;
-      r = v.indexOf('\r', s);
+      r = w.indexOf('\r', s);
     }
-    out += v.slice(s);
-    added += v.length - s;
-    return [out, ending, added];
+    out += w.slice(s);
+    added += w.length - s;
+    lastEnded = ending;
+    lastAdded = added;
+    return out;
   }
 
   // What follows a closed quoted field: comma, line break, end of text, or
@@ -132,24 +157,30 @@ export function run(input) {
   // `value` is the quoted content, `p` the position after the closing quote.
   function afterQuoted(value, p) {
     pos = p;
-    if (pos >= n) return [value, END, 0];
+    if (pos >= n) {
+      lastEnded = END;
+      return value;
+    }
     const c = text.charCodeAt(pos);
     if (c === 44) {
       pos += 1;
-      return [value, COMMA, 0];
+      lastEnded = COMMA;
+      return value;
     }
     if (c === 10) {
       pos += 1;
       line += 1;
-      return [value, LINE_BREAK, 0];
+      lastEnded = LINE_BREAK;
+      return value;
     }
     if (c === 13 && text.charCodeAt(pos + 1) === 10) {
       pos += 2;
       line += 1;
-      return [value, LINE_BREAK, 0];
+      lastEnded = LINE_BREAK;
+      return value;
     }
     const junk = readUnquoted(value, 0);
-    if (junk[2] > 0) err('quote_junk');
+    if (lastAdded > 0) err('quote_junk');
     return junk;
   }
 
@@ -254,8 +285,8 @@ export function run(input) {
     do {
       quoted = text.charCodeAt(pos) === 34;
       field = quoted ? readQuoted() : readUnquoted('', 0);
-      fields.push(field[0]);
-    } while (field[1] === COMMA);
+      fields.push(field);
+    } while (lastEnded === COMMA);
 
     // A line that held only stray CRs is left with no characters: no record (its stray_cr errors stay).
     if (fields.length === 1 && fields[0] === '' && !quoted) continue;
